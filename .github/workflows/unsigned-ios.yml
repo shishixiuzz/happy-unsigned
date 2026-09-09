@@ -172,23 +172,24 @@ jobs:
           command -v ninja || { echo "缺少 ninja"; exit 1; }
           npx pod-install
 
-      # ---- 4.5) expo-splash-screen 55.0.12 的 Swift 6 并发硬伤 ----
-      # expo-splash-screen 保留 swift_version=6.0 用 Swift 6 语言模式编译，
-      # Swift 6.2+/7 严格并发下 `static let shared`（非 Sendable 可变单例）
-      # 是硬 error（55.0.12 未含上游修复）。
-      # ★ 修法 = @unchecked Sendable（不是 @MainActor！）：
-      #   @MainActor 会把整个类隔离化，SplashScreenModule 的非隔离调用点
-      #   （shared.setOptions/hide/preventAutoHideCalled）全变 error。
+      # ---- 4.5) Swift 6 语言模式 pod 的并发硬伤（一次性排净）----
+      # 只有 4 个 pod 用 -swift-version 6 编译（日志实证）：
+      #   ExpoModulesCore / ExpoLogBox / ExpoSplashScreen / ExpoNotifications
+      # Swift 6.2+/7 下 `static let shared = X()`（X 非 Sendable class）是硬 error。
+      # ★ 修法 = @unchecked Sendable（不是 @MainActor！@MainActor 会级联隔离
+      #   到所有调用点，实测炸 17 error）。
       # ★★ 位置陷阱：@unchecked Sendable 是 conformance 标记，只能放继承子句
-      #   `: NSObject, RCTReloadListener, @unchecked Sendable`，不能像 @MainActor
-      #   那样放声明属性位（`@unchecked Sendable public class` 是语法错误：
-      #   "attribute only applies in inheritance clauses"，run 34395393255 已证）。
-      - name: Patch expo-splash-screen @unchecked Sendable (Swift 6 concurrency)
+      #   `: NSObject, P, @unchecked Sendable`；放声明属性位是语法错误
+      #   （run 34395393255 实证）。扫描器只动 4 个 pod、跳过 struct/actor/已标
+      #   Sendable/nonisolated 的类，幂等。
+      - name: Patch Swift-6 pod concurrency errors (@unchecked Sendable)
         working-directory: packages/happy-app
         run: |
           set -e
-          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_expo_splash_actor.py" "$GITHUB_WORKSPACE"
-          head -6 "$GITHUB_WORKSPACE/node_modules/expo-splash-screen/ios/SplashScreenManager.swift"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_swift6_concurrency.py" "$GITHUB_WORKSPACE"
+          echo "--- 抽查产物 ---"
+          grep -n "class SplashScreenManager" "$GITHUB_WORKSPACE/node_modules/expo-splash-screen/ios/SplashScreenManager.swift" || true
+          grep -n -A1 "class NotificationCenterManager" "$GITHUB_WORKSPACE/node_modules/expo-notifications/ios/ExpoNotifications/Notifications/NotificationCenterManager.swift" || true
 
       # ---- 5) 探测 scheme ----
       - name: Discover scheme
