@@ -84,7 +84,16 @@ export default function RootLayout() {
             <Stack.Screen
                 name="session/[id]"
                 options={{
-                    headerShown: false
+                    headerShown: false,
+                    // The native-stack bar defaults its title to the ROUTE NAME
+                    // when no title is set. iOS 15 keeps a stale nav bar visible
+                    // over this screen after pushing/popping child screens
+                    // (e.g. /session/[id]/info) whose header is shown, and with
+                    // no title set it printed "session/[id]" on top of the
+                    // custom glass ChatHeaderView pill. An explicit empty title
+                    // makes any ghost bar text-free on every iOS version.
+                    title: '',
+                    headerTitle: '',
                 }}
             />
             <Stack.Screen
