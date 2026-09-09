@@ -34,7 +34,7 @@ path = os.path.join(
 with io.open(path, encoding='utf-8') as f:
     src = f.read()
 
-if re.search(r'\bpublic\s+@MainActor\s+class SplashScreenManager|@MainActor\s+class SplashScreenManager', src):
+if re.search(r'@MainActor\s+(?:public\s+)?class SplashScreenManager', src):
     print('SKIP: SplashScreenManager already @MainActor')
     sys.exit(0)
 
