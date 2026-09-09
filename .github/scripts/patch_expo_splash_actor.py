@@ -17,8 +17,18 @@ nonisolated contexts -> 17 errors). The class is an AppDelegate-level UI
 singleton used only on the main thread, so @unchecked Sendable is the surgical
 fix: it satisfies the static-let concurrency check without changing isolation.
 
+★★ SYNTAX POSITION — @unchecked Sendable goes in the INHERITANCE CLAUSE,
+   NOT in declaration-attribute position! (Run 34395393255 failed here.)
+   `@unchecked Sendable public class X: ...` is INVALID:
+     error: expressions are not allowed at the top level
+     error: 'unchecked' attribute only applies in inheritance clauses
+   The attribute-form `@unchecked Sendable` on a class is only valid for
+   @MainActor-style GLOBAL ACTOR attributes. For conformance marking, write:
+     public class SplashScreenManager: NSObject, RCTReloadListener, @unchecked Sendable {
+   (canonical SE-0302 form, matches the compiler's own suggestion)
+
 用法: python3 patch_expo_splash_actor.py <repo_root>
-幂等：已含 '@unchecked Sendable class SplashScreenManager' 时直接打印 skipped。
+幂等：类已含 '@unchecked Sendable'（继承子句里）时直接打印 skipped。
 """
 import io
 import os
@@ -34,16 +44,16 @@ path = os.path.join(
 with io.open(path, encoding='utf-8') as f:
     src = f.read()
 
-if re.search(r'@unchecked Sendable\s+(?:public\s+)?class SplashScreenManager', src):
+# 幂等：继承子句里已带 @unchecked Sendable 就跳过。
+if re.search(r'class\s+SplashScreenManager[^{]*@unchecked Sendable', src):
     print('SKIP: SplashScreenManager already @unchecked Sendable')
     sys.exit(0)
 
-# 安装包里的源码有两种写法：`class SplashScreenManager` 或 `public class SplashScreenManager`。
-# Swift 语法要求 attribute（@unchecked Sendable）在访问控制符（public）之前，
-# 所以必须把 attribute 插在 class 关键字正前方，不能简单前置到整行。
+# 把 @unchecked Sendable 追加到继承子句末尾（superclass 和 protocols 之后）。
+# 兼容 `class X:` 与 `public class X:` 两种安装包写法；继承列表用 [^{]+? 惰性匹配。
 new, n = re.subn(
-    r'(\b(?:public\s+)?)class\s+SplashScreenManager\s*:\s*NSObject,\s*RCTReloadListener\s*\{',
-    r'@unchecked Sendable \1class SplashScreenManager: NSObject, RCTReloadListener {',
+    r'((?:public\s+)?)class\s+SplashScreenManager\s*:\s*([^{]+?)\s*(\{)',
+    r'\1class SplashScreenManager: \2, @unchecked Sendable \3',
     src,
     count=1,
 )
@@ -52,4 +62,4 @@ src = new
 
 with io.open(path, 'w', encoding='utf-8') as f:
     f.write(src)
-print('PATCHED: %s -> @unchecked Sendable' % path)
+print('PATCHED: %s -> class ...: ..., @unchecked Sendable' % path)

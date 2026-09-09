@@ -179,8 +179,10 @@ jobs:
       # ★ 修法 = @unchecked Sendable（不是 @MainActor！）：
       #   @MainActor 会把整个类隔离化，SplashScreenModule 的非隔离调用点
       #   （shared.setOptions/hide/preventAutoHideCalled）全变 error。
-      #   该类是 AppDelegate 级 UI 单例、只在主线程使用，@unchecked Sendable
-      #   恰好满足 static-let 并发检查且不改变隔离模型。
+      # ★★ 位置陷阱：@unchecked Sendable 是 conformance 标记，只能放继承子句
+      #   `: NSObject, RCTReloadListener, @unchecked Sendable`，不能像 @MainActor
+      #   那样放声明属性位（`@unchecked Sendable public class` 是语法错误：
+      #   "attribute only applies in inheritance clauses"，run 34395393255 已证）。
       - name: Patch expo-splash-screen @unchecked Sendable (Swift 6 concurrency)
         working-directory: packages/happy-app
         run: |
