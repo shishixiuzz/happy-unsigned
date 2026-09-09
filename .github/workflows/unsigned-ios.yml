@@ -1,0 +1,270 @@
+name: Build unsigned iOS IPA (TrollStore / iOS 15)
+
+# 用途：给 TrollStore 生成"未签名"IPA，不需要任何 Apple 证书/账号。
+# 纯个人自用侧载，不进 App Store。
+#
+# 手动触发：Actions → 本 workflow → Run workflow → 下载 happy-unsigned.ipa
+#
+# ⚠️ 真正的硬墙（非"改版本号"能解决）：
+#   1) RN 0.83.1 的 react-native pod 在 scripts/cocoapods/helpers.rb 写死
+#      min_ios_version_supported = '15.1'。CocoaPods 强制「工程 target >= pod min」，
+#      所以要把 RN 常量降到 15.0（已做），否则 pod install 直接报错。
+#   2) Hermes（JS 引擎）官方预编译二进制是 iOS 15.1 的：Maven Central 的
+#      hermes-ios-0.14.0-xcframework Info.plist MinimumOSVersion = 15.1。
+#      这二进制是预编译包，改 podspec 数字没用——iOS 15.0 上 dyld 会拒载，
+#      App 启动即崩。且 happy-app 用 reanimated v4 → 强制 New Arch → 强制 Hermes，
+#      无法换 JSC。
+#     ★ 正解 = Hermes 从源码构建：RCT_BUILD_HERMES_FROM_SOURCE=true 触发
+#       clone GitHub 源码编译，其 iOS deployment target 读 IPHONEOS_DEPLOYMENT_TARGET
+#       （= 工程 target, 已降到 15.0）→ 产出真正 15.0 兼容的引擎。
+#      代价：Hermes 源码编译非常慢（CI 上约 30-60 分钟）。
+#    ⚠️ closure 已确认：工程 target=15.0 会自动透传给 Hermes 源码构建，
+#       无需额外设 Hermes 专属变量。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle-id:
+        description: "App bundle id（换成你自己的，别用官方 com.ex3ndr.happy）"
+        required: false
+        default: "com.slopus.happy.trollstore"
+        type: string
+      deployment-target:
+        description: "iOS deployment target"
+        required: false
+        default: "15.0"
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-15
+    concurrency:
+      group: unsigned-ios-build
+      cancel-in-progress: false
+
+    env:
+      APP_ENV: production
+      NEW_TARGET: ${{ inputs.deployment-target }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ★★ Xcode 16.4 带的是 Swift 6.1 —— 没有 SE-0447 isolated conformances！
+      #   ExpoModulesCore 55.0.17 用了 `extension X: @MainActor P` 语法（conformance 位置
+      #   的 @MainActor），该特性在 Swift 6.1 不存在，6.2 才成为默认启用的
+      #   LANGUAGE_FEATURE。所以即使 -swift-version 6 语言模式正确，编译器本体
+      #   不认识 → `unknown attribute 'MainActor'`（三处全是 conformance 位置）。
+      #   正解 = 切到镜像预装的最新 Xcode 26.x（Swift 7，必然支持）。
+      - name: Use latest Xcode (Swift 6.2+ for SE-0447 isolated conformances)
+        run: |
+          set -e
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort | tail -1)
+          if [ -n "$XC" ]; then
+            sudo xcode-select -s "$XC"
+            echo "switched to: $XC"
+          else
+            echo "no Xcode 26 found, keeping default"
+          fi
+          xcodebuild -version
+          swiftc --version
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: "10.11.0"
+
+      - name: Install dependencies
+        working-directory: packages/happy-app
+        env:
+          SHARP_IGNORE_GLOBAL_LIBVIPS: "1"
+        run: pnpm install --no-frozen-lockfile
+
+      # Firebase google-services.json（含 Google API key）由 secret 还原，不入仓
+      - name: Restore google-services.json from secret
+        working-directory: packages/happy-app
+        env:
+          GS_B64: ${{ secrets.GOOGLE_SERVICES_B64 }}
+        run: |
+          set -e
+          if [ -n "$GS_B64" ]; then
+            echo "$GS_B64" | base64 --decode > google-services.json
+            echo "restored: $(wc -c < google-services.json) bytes"
+          else
+            echo '!! GOOGLE_SERVICES_B64 secret missing'
+            exit 1
+          fi
+
+      # ---- 1) 改成自定义 bundle id，避免与官方 store 版冲突 ----
+      - name: Replace bundle id
+        working-directory: packages/happy-app
+        run: |
+          sed -i '' "s|com.ex3ndr.happy|${{ inputs.bundle-id }}|g" app.config.js
+          grep -n "bundleIdentifier" app.config.js || true
+
+      # ---- 2) 生成原生 ios 工程（纯 Expo，必须 prebuild，先不装 pods）----
+      - name: Expo prebuild (generate ios/)
+        working-directory: packages/happy-app
+        run: npx expo prebuild --platform ios --no-install
+
+      # ---- 3) 根因：把 RN/Expo/Hermes/dependency 所有 pod 的 iOS 部署目标统一压到目标 ----
+      # ★上轮屡败根因 = 用 `find -L` 扫 node_modules 做文本替换。pnpm 里 node_modules
+      #   是 symlink，`find -L` 跟随语义在 macOS 上不可靠 → Expo / Hermes / ExpoModulesCore
+      #   的 podspec 从没被扫到（日志里「已清零」其实是空跑），CocoaPods 一直报
+      #   "Expo ... required a higher minimum deployment target"。
+      #   → 本轮换成 node 脚本：realpathSync 穿透 symlink 取真实绝对路径必中；
+      #     用上下文感知正则（:ios => / platform :ios / .deployment_target 等）一次压掉
+      #     任意版本（15.1 / 16.x），不再只匹配字面量 15.1。结尾硬断言必须命中
+      #     Expo / ExpoModulesCore / Hermes 三处，否则 fail loud（绝不再打地鼠）。
+      - name: Patch all iOS deployment targets to $NEW_TARGET
+        working-directory: packages/happy-app
+        run: |
+          set -e
+          node "${{ github.workspace }}/scripts/flatten-ios-target.mjs" "$GITHUB_WORKSPACE/packages/happy-app" "$NEW_TARGET"
+          echo "--- 已清零 15.1 / 16.x 校验（残留者应无） ---"
+          ( find -L node_modules -name '*.podspec' 2>/dev/null \
+              -exec grep -HnE "[:>=>]?\\s*(ios|:ios)[:,=]\\s*['\"](15|16)\\.[0-9]+['\"]" {} + 2>/dev/null | head ) || true
+          echo "  （以上为空 = 平台已统一到 $NEW_TARGET）"
+
+      # ---- 4) 把生成的 ios 工程 deployment target 也降到 15.0 ----
+      - name: Set Xcode deployment target to $NEW_TARGET
+        working-directory: packages/happy-app
+        run: |
+          set -e
+          # 用 perl（跨平台）而非 sed：runner 是 macOS(BSD sed)，BSD 的 -i 需带 '' 空参，
+          # 直接用 -i 会报 "command expect\" 崩溃。perl -pi 无此问题。
+          # Expo 生成的 Podfile 形如：
+          #     platform :ios, podfile_properties['ios.deploymentTarget'] || '15.1'
+          # 把兜底默认值替换为目标版本：
+          perl -pi -e "s/\|\| '[0-9.]+'/|| '$NEW_TARGET'/" ios/Podfile
+          echo "Podfile platform: $(grep -E '^platform :ios' ios/Podfile || echo '(none found)')"
+          # xcodeproj / xcshared data 里的 IPHONEOS_DEPLOYMENT_TARGET -> 15.0
+          find ios -name project.pbxproj | while read -r f; do
+            perl -pi -e "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;/IPHONEOS_DEPLOYMENT_TARGET = $NEW_TARGET;/" "$f"
+            echo "patched: $f -> $(grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;' "$f" | head -1)"
+          done
+          grep -rH "IPHONEOS_DEPLOYMENT_TARGET" ios --include=project.pbxproj | sort -u || true
+
+          # ★ 主工程 App target 的 SWIFT_VERSION 写死 6.0（匹配 Expo 55 swift_version）。
+          #   只改主工程 pbxproj；Pods 工程各 pod 用 podspec 声明的 swift_version
+          #   （lottie-ios=5.9 编译成 Swift5，Expo 系=6.0 编译成 Swift6）。
+          #   不能再用全局 xcodebuild SWIFT_VERSION 覆盖——那会把 lottie 也逼成 Swift6 挂掉。
+          MAIN_PBX=$(find ios -maxdepth 2 -name project.pbxproj -not -path '*/Pods/*' | head -1)
+          echo "main pbxproj: $MAIN_PBX"
+          perl -pi -e 's/SWIFT_VERSION = [0-9.]+;/SWIFT_VERSION = 6.0;/' "$MAIN_PBX"
+          if grep -q 'SWIFT_VERSION = 6.0' "$MAIN_PBX"; then
+            echo "SWIFT_VERSION 已写 6.0"
+          else
+            # 模板没有 SWIFT_VERSION 键则插入每个 buildSettings 块
+            perl -0pi -e 's/(buildSettings = \{)/$1\n\t\t\t\tSWIFT_VERSION = 6.0;/g' "$MAIN_PBX"
+            echo "SWIFT_VERSION 已插入 (buildSettings)"
+          fi
+          grep -oE 'SWIFT_VERSION = [0-9.]+;' "$MAIN_PBX" | sort -u
+
+      - name: pod install (Hermes from source)
+        working-directory: packages/happy-app
+        env:
+          SHARP_IGNORE_GLOBAL_LIBVIPS: "1"
+          # ★ 路线 B 核心开关：Hermes 不再下载官方 iOS-15.1 预编译包，
+          #    而是 clone GitHub 源码在本机编译。其 iOS deployment target
+          #    自动读工程 target (=15.0)，真正兼容 iOS 15.0。
+          RCT_BUILD_HERMES_FROM_SOURCE: "true"
+        run: |
+          set -e
+          # ★ 通用 Swift 语言模式兜底：RN 生态里有些 podspec 声明 swift_version=6.0
+          #   但代码没适配 Swift 6 并发（vision-camera 4.7.3 实测报 actor/global-state 错）。
+          #   在 Podfile post_install 里把所有非 Expo 官方 pod 强制 Swift 5 语言模式；
+          #   Expo 系（Expo/ExpoModulesCore/ExpoLogBox/expo-*）保留 podspec 的 6.0
+          #   （expo-modules-core 真的用了 Swift 6 的 @MainActor attribute 语法）。
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_podfile_swift.py" ios/Podfile
+          grep -A3 "post_install do" ios/Podfile | head -6
+          # Hermes 从源码构建需要 cmake + ninja（macOS runner 已预装，确认一下）
+          command -v cmake || { echo "缺少 cmake"; exit 1; }
+          command -v ninja || { echo "缺少 ninja"; exit 1; }
+          npx pod-install
+
+      # ---- 4.5) expo-splash-screen 55.0.12 的 Swift 6 并发硬伤 ----
+      # expo-splash-screen 保留 swift_version=6.0 用 Swift 6 语言模式编译，
+      # Swift 6.2+/7 严格并发下 `static let shared`（非 Sendable 可变单例）
+      # 是硬 error（55.0.12 未含上游 @MainActor 修复）。
+      # 该类是 AppDelegate 级 UI 单例（管理 splash view + NotificationCenter），
+      # 所有调用点（ExpoAppDelegateSubscriber / Module）本就 MainActor 隔离，
+      # 加 @MainActor 与上游修复一致且安全。
+      - name: Patch expo-splash-screen @MainActor (Swift 6 concurrency)
+        working-directory: packages/happy-app
+        run: |
+          set -e
+          python3 "$GITHUB_WORKSPACE/.github/scripts/patch_expo_splash_actor.py" "$GITHUB_WORKSPACE"
+          head -6 "$GITHUB_WORKSPACE/node_modules/expo-splash-screen/ios/SplashScreenManager.swift"
+
+      # ---- 5) 探测 scheme ----
+      - name: Discover scheme
+        id: scheme
+        working-directory: packages/happy-app
+        run: |
+          set -e
+          WS=$(find ios -name '*.xcworkspace' | head -1)
+          [ -z "$WS" ] && WS=$(find ios -name '*.xcodeproj' | head -1)
+          echo "WS=$WS"
+          [ -z "$WS" ] && { echo "no ios project generated"; exit 1; }
+
+          # 依次尝试(a) xcodesecheme 文件 -> (b) xcodebuild -list(workspace) ->
+          # (c) xcodebuild -list(project) -> (d) 项目名兜底。
+          SCHEME=$(find ios -name '*.xcscheme' -not -path '*/Pods/*' 2>/dev/null \
+                   | head -1 | xargs -n1 basename 2>/dev/null | sed 's/\.xcscheme$//')
+          [ -z "$SCHEME" ] && SCHEME=$(xcodebuild -list "$WS" 2>/dev/null \
+                   | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
+          [ -z "$SCHEME" ] && SCHEME=$(xcodebuild -list -project "$(find ios -name '*.xcodeproj' | head -1)" 2>/dev/null \
+                   | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
+          [ -z "$SCHEME" ] && SCHEME=$(basename "$WS" | sed -E 's/\.(xcworkspace|xcodeproj)$//')
+          echo "SCHEME=$SCHEME"
+          [ -z "$SCHEME" ] && { echo "no scheme"; exit 1; }
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+          echo "ws=$WS" >> "$GITHUB_OUTPUT"
+
+      # ---- 6) 未签名编译 + 打包 ipa ----
+      - name: Build unsigned .app and package .ipa
+        working-directory: packages/happy-app
+        run: |
+          set -e
+          WS="${{ steps.scheme.outputs.ws }}"
+          SCHEME="${{ steps.scheme.outputs.scheme }}"
+          [ -z "$SCHEME" ] && { echo "no scheme"; exit 1; }
+          # ★★ SWIFT_VERSION 决不能全局覆盖（命令行 build setting 优先级最高）：
+          #   全局 =6 会把 lottie-ios 这类 Swift5 三方库强制成 Swift 6 语言模式编译，
+          #   报一堆 main-actor/全局状态错误（minimal strict concurrency 关不掉语言级检查）。
+          #   正解：不传全局 SWIFT_VERSION，让每个 pod 用自己 podspec 声明的 swift_version
+          #   （Expo 系 =6.0，lottie-ios =5.9）各自编译；主工程 App target 的
+          #   SWIFT_VERSION=6.0 已在「Set Xcode deployment target」步骤写入 pbxproj。
+          echo "building scheme=$SCHEME workspace=$WS (per-pod SWIFT_VERSION, no global override)"
+          xcodebuild \
+            -workspace "$WS" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "${RUNNER_TEMP}/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SWIFT_STRICT_CONCURRENCY=minimal build
+
+          APP_DIR=$(find "${RUNNER_TEMP}/build/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -1)
+          echo "app bundle: ${APP_DIR}"
+          [ -z "$APP_DIR" ] && { echo "no .app produced"; exit 1; }
+
+          mkdir -p Payload
+          cp -R "$APP_DIR" Payload/
+          IPA="$GITHUB_WORKSPACE/happy-unsigned-${NEW_TARGET}.ipa"
+          ditto -c -k --sequesterRsrc --keepParent Payload "$IPA"
+          rm -rf Payload
+          echo "IPA ready: $IPA"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: happy-unsigned-ipa
+          path: happy-unsigned-*.ipa
+          if-no-files-found: error
