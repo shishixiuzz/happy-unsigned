@@ -160,13 +160,15 @@ jobs:
           RCT_BUILD_HERMES_FROM_SOURCE: "true"
         run: |
           set -e
-          # ★ 通用 Swift 语言模式兜底：RN 生态里有些 podspec 声明 swift_version=6.0
-          #   但代码没适配 Swift 6 并发（vision-camera 4.7.3 实测报 actor/global-state 错）。
-          #   在 Podfile post_install 里把所有非 Expo 官方 pod 强制 Swift 5 语言模式；
-          #   Expo 系（Expo/ExpoModulesCore/ExpoLogBox/expo-*）保留 podspec 的 6.0
-          #   （expo-modules-core 真的用了 Swift 6 的 @MainActor attribute 语法）。
+          # ★ Swift 语言模式白名单（日志实证只有 4 个 pod 用 -swift-version 6）：
+          #   ExpoModulesCore（SE-0447 隔离 conformance，必须 6）/ Expo /
+          #   ExpoLogBox / ExpoSplashScreen（这 3 个 Swift 6 下编译干净）。
+          #   其余全部强制 Swift 5 语言模式——包括 expo-notifications
+          #   （55.0.27 没适配 Swift 6 并发：static let shared 之外的
+          #   sending/isolation 硬 error 无法用 @unchecked Sendable 修，
+          #   只能降级；3 次 run 实证）+ 所有三方 pod。
           python3 "$GITHUB_WORKSPACE/.github/scripts/patch_podfile_swift.py" ios/Podfile
-          grep -A3 "post_install do" ios/Podfile | head -6
+          grep -A4 "post_install do" ios/Podfile | head -8
           # Hermes 从源码构建需要 cmake + ninja（macOS runner 已预装，确认一下）
           command -v cmake || { echo "缺少 cmake"; exit 1; }
           command -v ninja || { echo "缺少 ninja"; exit 1; }
