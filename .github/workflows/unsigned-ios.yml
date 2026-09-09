@@ -84,21 +84,6 @@ jobs:
           SHARP_IGNORE_GLOBAL_LIBVIPS: "1"
         run: pnpm install --no-frozen-lockfile
 
-      # Firebase google-services.json（含 Google API key）由 secret 还原，不入仓
-      - name: Restore google-services.json from secret
-        working-directory: packages/happy-app
-        env:
-          GS_B64: ${{ secrets.GOOGLE_SERVICES_B64 }}
-        run: |
-          set -e
-          if [ -n "$GS_B64" ]; then
-            echo "$GS_B64" | base64 --decode > google-services.json
-            echo "restored: $(wc -c < google-services.json) bytes"
-          else
-            echo '!! GOOGLE_SERVICES_B64 secret missing'
-            exit 1
-          fi
-
       # ---- 1) 改成自定义 bundle id，避免与官方 store 版冲突 ----
       - name: Replace bundle id
         working-directory: packages/happy-app
@@ -190,11 +175,13 @@ jobs:
       # ---- 4.5) expo-splash-screen 55.0.12 的 Swift 6 并发硬伤 ----
       # expo-splash-screen 保留 swift_version=6.0 用 Swift 6 语言模式编译，
       # Swift 6.2+/7 严格并发下 `static let shared`（非 Sendable 可变单例）
-      # 是硬 error（55.0.12 未含上游 @MainActor 修复）。
-      # 该类是 AppDelegate 级 UI 单例（管理 splash view + NotificationCenter），
-      # 所有调用点（ExpoAppDelegateSubscriber / Module）本就 MainActor 隔离，
-      # 加 @MainActor 与上游修复一致且安全。
-      - name: Patch expo-splash-screen @MainActor (Swift 6 concurrency)
+      # 是硬 error（55.0.12 未含上游修复）。
+      # ★ 修法 = @unchecked Sendable（不是 @MainActor！）：
+      #   @MainActor 会把整个类隔离化，SplashScreenModule 的非隔离调用点
+      #   （shared.setOptions/hide/preventAutoHideCalled）全变 error。
+      #   该类是 AppDelegate 级 UI 单例、只在主线程使用，@unchecked Sendable
+      #   恰好满足 static-let 并发检查且不改变隔离模型。
+      - name: Patch expo-splash-screen @unchecked Sendable (Swift 6 concurrency)
         working-directory: packages/happy-app
         run: |
           set -e
