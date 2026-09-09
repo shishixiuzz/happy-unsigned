@@ -22,6 +22,7 @@ upstream: newer expo-splash-screen added @MainActor on the class.
 """
 import io
 import os
+import re
 import sys
 
 root = sys.argv[1] if len(sys.argv) > 1 else '.'
@@ -40,7 +41,6 @@ if re.search(r'\bpublic\s+@MainActor\s+class SplashScreenManager|@MainActor\s+cl
 # 安装包里的源码有两种写法：`class SplashScreenManager` 或 `public class SplashScreenManager`。
 # Swift 语法要求 attribute（@MainActor）在访问控制符（public）之前，
 # 所以必须把 @MainActor 插在 class 关键字正前方，不能简单前置到整行。
-import re
 new, n = re.subn(
     r'(\b(?:public\s+)?)class\s+SplashScreenManager\s*:\s*NSObject,\s*RCTReloadListener\s*\{',
     r'@MainActor \1class SplashScreenManager: NSObject, RCTReloadListener {',
