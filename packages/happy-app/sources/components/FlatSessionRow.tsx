@@ -13,7 +13,7 @@ import { useSessionPressHandlers } from '@/hooks/useNavigateToSession';
 import { useSessionActionAlert } from '@/hooks/useSessionQuickActions';
 import { useHappyAction } from '@/hooks/useHappyAction';
 import { HappyError } from '@/utils/errors';
-import { sessionKill } from '@/sync/ops';
+import { sessionArchive, sessionKill } from '@/sync/ops';
 import type { FlatSessionRowData } from '@/utils/flatSessionList';
 import { formatSessionListTimestamp } from '@/utils/sessionListTimestamp';
 import type { Theme } from '@/theme';
@@ -108,7 +108,15 @@ export const FlatSessionRow = React.memo(({ row, selected, showBorder, archived 
     const [archiving, performArchive] = useHappyAction(async () => {
         const result = await sessionKill(session.id);
         if (!result.success) {
-            throw new HappyError(result.message || t('sessionInfo.failedToArchiveSession'), false);
+            // The session's own CLI process is not reachable — it already
+            // ended, the machine daemon restarted, or the device slept, so
+            // the killSession RPC answered 'RPC method not available'.
+            // Force-archive server-side (same fallback as the info page /
+            // quick actions); only surface an error if that also fails.
+            const archived = await sessionArchive(session.id);
+            if (!archived.success) {
+                throw new HappyError(result.message || t('sessionInfo.failedToArchiveSession'), false);
+            }
         }
     });
 
